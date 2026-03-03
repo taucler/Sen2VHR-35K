@@ -45,5 +45,9 @@ venv.bak/
 
 # Data
 data/
+gpkg/
+parquet/
 *.parquet
 *.gpkg
+tmp_downloads/
+fig/

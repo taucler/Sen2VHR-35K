@@ -1,25 +1,16 @@
 """
-Script: Download and Process VHR Data
+VHR download + crop in EPSG:3035, with:
+1) strict 1280x1280 px check (count how many fail)
+2) if multiple TIFFs are present, mosaic them on-the-fly per window to fill coverage
 
-This script automates the process of downloading Very High Resolution (VHR) satellite imagery data from the Copernicus Data Space Ecosystem (CDSE). It performs the following tasks:
-
-1. **Authentication**: Retrieves an access token for the CDSE API using user credentials.
-2. **Catalog Query**: Resolves datastrip and product names to unique identifiers (UUIDs) for downloading.
-3. **Data Download**: Downloads VHR data in SAFE format and extracts GeoTIFF files.
-4. **Window Cropping**: Crops the downloaded VHR imagery to match predefined training windows, ensuring full coverage within the window geometry.
-5. **Data Filtering**: Filters out incomplete or invalid windows based on geometry and data quality.
-6. **Output Management**: Saves the processed VHR data and metadata to specified output directories and logs the process.
-
-Purpose: This script is part of the VHR super-resolution pipeline. It ensures that the VHR data is properly downloaded, processed, and aligned with the training windows for further analysis and model training.
-
-Dependencies:
-- Python libraries: `os`, `re`, `shutil`, `zipfile`, `pathlib`, `random`, `time`, `datetime`, `numpy`, `pandas`, `requests`, `tqdm`, `geopandas`, `shapely`, `rasterio`.
-- External tools: Copernicus Data Space Ecosystem API.
-
-Usage:
-Run the script as a standalone program. Ensure that the required input files and credentials are correctly configured in the `CONFIG` section.
-
+Notes:
+- We keep everything in the VHR raster CRS (typically EPSG:3035) and write output in that CRS.
+- Mosaic is done only for the subset of tifs that intersect the window (fast enough, avoids building a full mosaic).
+- We still keep the previous “no invalid pixels inside polygon” check.
+  If you want to relax that later, it’s a single if-block.
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -38,6 +29,8 @@ from shapely import wkt
 import rasterio
 from rasterio.mask import mask
 from rasterio.features import geometry_mask
+from rasterio.merge import merge
+from rasterio.io import MemoryFile
 
 from cdse_auth import get_access_token
 from helpers import odata_get_with_retry, log_line, load_done_set, mark_done
@@ -47,7 +40,7 @@ load_dotenv()
 # -----------------------
 # CONFIG
 # -----------------------
-META_PARQUET = "parquet/windows_best_s2_with_vza_angleDiffLE4_withSCL_split_byDatastrip.parquet"
+META_PARQUET = "parquet/windows_best_s2_with_vza_angleDiffLE5_withSCL_split_byDatastrip.parquet"
 CATALOG_GPKG = "gpkg/vhr2024_joined_acq_catalog.gpkg"
 
 OUT_ROOT = Path("data")
@@ -58,13 +51,15 @@ N_DATASTRIPS = None  # set None or remove slicing for full run
 
 WIN_CRS = "EPSG:3035"
 
-DATASET_NAME = "VHR_IMAGE_2024" # exists with 2021, 2018 and 2015 versions too, hasn't been tested 
+DATASET_NAME = "VHR_IMAGE_2024"
 
-CDSE_USERNAME = os.getenv("CDSE_USERNAME")  
+CDSE_USERNAME = os.getenv("CDSE_USERNAME")
 CDSE_PASSWORD = os.getenv("CDSE_PASSWORD")
 
-# output parquet with only kept windows
 OUT_KEPT_PARQUET = "parquet/windows_with_downloaded_vhr.parquet"
+
+# Expected output size in pixels (2m * 1280 = 2560m)
+EXPECTED_PX = 1280
 
 # -----------------------
 # Name logic: SAFE.zip -> COG name
@@ -104,14 +99,13 @@ def resolve_uuid_by_exact_name(cog_name: str, token: str, refresh_token_fn) -> t
     token2 = headers2["Authorization"].split(" ", 1)[1]
     return uuid_id, token2
 
-
 # -----------------------
 # Download + extract GeoTIFF(s)
 # -----------------------
 def download_and_extract_tifs(uuid_id: str, cog_name: str, token: str, out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    url = f"{os.getenv("DOWNLOAD_URL")}({uuid_id})/$value"
+    url = f"{os.getenv('DOWNLOAD_URL')}({uuid_id})/$value"
     headers = {"Authorization": f"Bearer {token}"}
 
     safe_name = sanitize_filename(cog_name)
@@ -128,7 +122,7 @@ def download_and_extract_tifs(uuid_id: str, cog_name: str, token: str, out_dir: 
                 if chunk:
                     f.write(chunk)
 
-    tif_paths = []
+    tif_paths: list[Path] = []
     with zipfile.ZipFile(zip_path, "r") as zf:
         for member in zf.infolist():
             fn = member.filename.lower()
@@ -145,84 +139,193 @@ def download_and_extract_tifs(uuid_id: str, cog_name: str, token: str, out_dir: 
 
     if not tif_paths:
         raise RuntimeError(f"No GeoTIFFs found in ZIP for '{cog_name}' (uuid={uuid_id})")
+
     return tif_paths
 
 # -----------------------
-# Crop windows by polygon geometry, filter partials, and return kept window_ids + valid_frac
+# Crop + (optional) mosaic per window + strict 1280x1280 check
 # -----------------------
-def crop_vhr_windows_by_geometry_filter(tif_paths, windows_df, out_dir):
+def crop_vhr_windows_by_geometry_filter(
+    tif_paths: list[Path],
+    windows_df: pd.DataFrame,
+    out_dir: Path,
+    expected_px: int = 1280,
+    max_mosaic_pixels: int = 250_000_000,  # safety: ~250M px total (bands excluded)
+):
+    """
+    Optimized: build ONE mosaic per datastrip (limited to bbox of all windows),
+    then crop all windows from that mosaic.
+
+    Safety:
+      - If the limited mosaic would still be huge, fallback to per-window mosaic.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dsets = [rasterio.open(p) for p in tif_paths]
-    kept = []
-    skipped = []
+    dsets = [rasterio.open(str(p)) for p in tif_paths]
+
+    kept: list[dict] = []
+    skipped: list[tuple[str, str]] = []
+
+    counts = {
+        "windows": 0,
+        "no_intersect": 0,
+        "empty": 0,
+        "mask_error": 0,
+        "wrong_shape": 0,
+        "mosaic_once_used": 0,
+        "mosaic_per_window_fallback": 0,
+        "saved": 0,
+    }
+
+    # --- prepare windows geometries once ---
+    gdf = windows_df.copy()
+    gdf["geometry"] = gdf["geometry_wkt"].apply(wkt.loads)
+    gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=WIN_CRS)
 
     try:
-        for row in tqdm(windows_df.itertuples(index=False), total=len(windows_df), desc="Crop VHR"):
+        # Pick a reference CRS/profile from the first dataset
+        ref = dsets[0]
+        ref_crs = ref.crs
+
+        # Reproject all window geometries into raster CRS (ref_crs)
+        geom_in_ref = gdf.geometry.to_crs(ref_crs)
+
+        # Compute bbox covering all windows (in raster CRS)
+        minx, miny, maxx, maxy = geom_in_ref.total_bounds
+        bounds = (float(minx), float(miny), float(maxx), float(maxy))
+
+        # Estimate mosaic size in pixels (rough) to decide if we do it once
+        # Use ref resolution
+        resx = abs(ref.transform.a)
+        resy = abs(ref.transform.e)
+        est_w = int(np.ceil((bounds[2] - bounds[0]) / resx))
+        est_h = int(np.ceil((bounds[3] - bounds[1]) / resy))
+        est_pixels = est_w * est_h
+
+        use_mosaic_once = est_pixels <= max_mosaic_pixels and est_w > 0 and est_h > 0
+
+        mosaic_ds = None
+        memfile = None
+
+        if use_mosaic_once:
+            counts["mosaic_once_used"] += 1
+
+            # Merge only within the windows bbox (fast + smaller)
+            mosaic_arr, mosaic_transform = merge(
+                dsets,
+                bounds=bounds,
+                # keep native resolution (if you want force: res=(resx, resy))
+                nodata=ref.nodata,
+            )
+
+            profile = ref.profile.copy()
+            profile.update(
+                height=mosaic_arr.shape[1],
+                width=mosaic_arr.shape[2],
+                transform=mosaic_transform,
+                driver="GTiff",
+            )
+
+            memfile = MemoryFile()
+            mosaic_ds = memfile.open(**profile)
+            mosaic_ds.write(mosaic_arr)
+
+        # --- per-window processing ---
+        for idx, row in enumerate(tqdm(gdf.itertuples(index=False), total=len(gdf), desc="Crop VHR")):
+            counts["windows"] += 1
+
             win_id = row.window_id
             out_path = out_dir / f"{win_id}.tif"
 
-            geom_3035 = wkt.loads(row.geometry_wkt)
-
-            chosen_ds, geom_in_ds = None, None
-            for ds in dsets:
-                g = gpd.GeoSeries([geom_3035], crs=WIN_CRS).to_crs(ds.crs).iloc[0]
-                gb = g.bounds
-                b = ds.bounds
-                if not (gb[2] <= b.left or gb[0] >= b.right or gb[3] <= b.bottom or gb[1] >= b.top):
-                    chosen_ds, geom_in_ds = ds, g
-                    break
-
-            if chosen_ds is None:
-                skipped.append((win_id, "no_intersect"))
+            if out_path.exists():
+                kept.append({"window_id": win_id, "vhr_path": str(out_path)})
                 continue
+
+            # geometry in raster CRS
+            g_ref = geom_in_ref.iloc[idx]
+
+            # Decide source dataset for crop:
+            # - If we have a global mosaic, use it
+            # - else fallback to per-window mosaic of intersecting tiles
+            src = mosaic_ds
+            close_src = False
+            close_mem = False
+
+            if src is None:
+                # fallback: find intersecting tiles
+                intersecting = []
+                for ds in dsets:
+                    gb = g_ref.bounds
+                    b = ds.bounds
+                    if not (gb[2] <= b.left or gb[0] >= b.right or gb[3] <= b.bottom or gb[1] >= b.top):
+                        intersecting.append(ds)
+
+                if not intersecting:
+                    counts["no_intersect"] += 1
+                    skipped.append((win_id, "no_intersect"))
+                    continue
+
+                if len(intersecting) == 1:
+                    src = intersecting[0]
+                else:
+                    counts["mosaic_per_window_fallback"] += 1
+                    arr, tr = merge(intersecting, nodata=ref.nodata)
+                    prof = intersecting[0].profile.copy()
+                    prof.update(height=arr.shape[1], width=arr.shape[2], transform=tr, driver="GTiff")
+
+                    mf = MemoryFile()
+                    tmp = mf.open(**prof)
+                    tmp.write(arr)
+
+                    src = tmp
+                    close_src = True
+                    close_mem = True
+                    tmp_memfile = mf  # keep reference for closing
 
             try:
                 out_img, out_transform = mask(
-                    chosen_ds,
-                    [geom_in_ds.__geo_interface__],
+                    src,
+                    [g_ref.__geo_interface__],
                     crop=True,
-                    filled=False
+                    filled=False,
                 )
             except ValueError as e:
+                counts["mask_error"] += 1
                 skipped.append((win_id, f"mask_error:{e}"))
+                if close_src:
+                    src.close()
+                if close_mem:
+                    tmp_memfile.close()
                 continue
 
+            if close_src:
+                src.close()
+            if close_mem:
+                tmp_memfile.close()
+
             if out_img.size == 0 or out_img.shape[1] == 0 or out_img.shape[2] == 0:
+                counts["empty"] += 1
                 skipped.append((win_id, "empty"))
                 continue
 
             H, W = out_img.shape[1], out_img.shape[2]
 
-            # True outside polygon
-            outside_poly = geometry_mask(
-                [geom_in_ds.__geo_interface__],
-                transform=out_transform,
-                out_shape=(H, W),
-                invert=False
-            )
-            inside_poly = ~outside_poly
-
-            masked = out_img.mask[0]  # True invalid (outside raster)
-            invalid_inside = masked & inside_poly
-
-            if invalid_inside.any():
-                skipped.append((win_id, f"incomplete_inside={int(invalid_inside.sum())}"))
+            # strict pixel size check
+            if H != expected_px or W != expected_px:
+                counts["wrong_shape"] += 1
+                skipped.append((win_id, f"wrong_shape={H}x{W}"))
                 continue
 
-            # OK — fully covered inside the polygon
-            nodata = chosen_ds.nodata
-            if nodata is None:
-                nodata = 0
+            nodata = ref.nodata if ref.nodata is not None else 0
             data_to_write = out_img.filled(nodata)
 
             dtype_kind = np.dtype(data_to_write.dtype).kind
             predictor = 3 if dtype_kind == "f" else 2
 
-            profile = chosen_ds.profile.copy()
+            profile = ref.profile.copy()
             profile.update(
-                height=data_to_write.shape[1],
-                width=data_to_write.shape[2],
+                height=H,
+                width=W,
                 transform=out_transform,
                 driver="GTiff",
                 tiled=True,
@@ -233,19 +336,34 @@ def crop_vhr_windows_by_geometry_filter(tif_paths, windows_df, out_dir):
 
             with rasterio.open(out_path, "w", **profile) as dst:
                 dst.write(data_to_write)
-                dst.scales = chosen_ds.scales
-                dst.offsets = chosen_ds.offsets
-                dst.update_tags(**chosen_ds.tags())
-                for b in range(1, chosen_ds.count + 1):
-                    dst.update_tags(b, **chosen_ds.tags(b))
+
+                # preserve scale/offset/tags
+                try:
+                    dst.scales = ref.scales
+                    dst.offsets = ref.offsets
+                except Exception:
+                    pass
+                try:
+                    dst.update_tags(**ref.tags())
+                    for b in range(1, ref.count + 1):
+                        dst.update_tags(b, **ref.tags(b))
+                except Exception:
+                    pass
 
             kept.append({"window_id": win_id, "vhr_path": str(out_path)})
+            counts["saved"] += 1
+
+        # close mosaic
+        if mosaic_ds is not None:
+            mosaic_ds.close()
+        if memfile is not None:
+            memfile.close()
 
     finally:
         for ds in dsets:
             ds.close()
 
-    return kept, skipped
+    return kept, skipped, counts
 
 # -----------------------
 # Map datastrip -> SAFE product_name from GPKG
@@ -275,7 +393,7 @@ def build_datastrip_to_product_name_map(gpkg_path: str) -> dict[str, str]:
 # -----------------------
 def main():
     if not CDSE_USERNAME or not CDSE_PASSWORD:
-        raise RuntimeError("Please set env vars CDSE_USER and CDSE_PASS.")
+        raise RuntimeError("Please set env vars CDSE_USERNAME and CDSE_PASSWORD.")
 
     for split in ["train", "val", "test"]:
         (OUT_ROOT / split / "vhr").mkdir(parents=True, exist_ok=True)
@@ -299,7 +417,7 @@ def main():
         datastrips = datastrips[:N_DATASTRIPS]
 
     done = load_done_set()
-    log_line(f"Already done datastrips: {len(done)}")   
+    log_line(f"Already done datastrips: {len(done)}")
 
     token = get_access_token(CDSE_USERNAME, CDSE_PASSWORD)
 
@@ -323,7 +441,9 @@ def main():
 
         if ds not in ds_to_safe_name:
             print(f"[WARN] datastrip not found in catalog gpkg: {ds}")
-            per_ds_summary.append({"datastrip": ds, "split": split, "windows": nwin, "kept": 0, "skipped": nwin, "error": "no_product_name"})
+            per_ds_summary.append(
+                {"datastrip": ds, "split": split, "windows": nwin, "kept": 0, "skipped": nwin, "error": "no_product_name"}
+            )
             continue
 
         safe_name = ds_to_safe_name[ds]
@@ -338,9 +458,10 @@ def main():
 
         try:
             uuid_id, token = resolve_uuid_by_exact_name(
-                cog_name, token, 
-                refresh_token_fn=lambda: get_access_token(CDSE_USERNAME, CDSE_PASSWORD)
-                )
+                cog_name,
+                token,
+                refresh_token_fn=lambda: get_access_token(CDSE_USERNAME, CDSE_PASSWORD),
+            )
             log_line(f"UUID: {uuid_id}")
 
             tif_paths = download_and_extract_tifs(uuid_id, cog_name, token, ds_tmp_dir)
@@ -348,12 +469,22 @@ def main():
 
             out_vhr_dir = OUT_ROOT / split / "vhr"
 
-            kept, skipped = crop_vhr_windows_by_geometry_filter(
-                tif_paths, ds_rows, out_vhr_dir)
+            kept, skipped, counts = crop_vhr_windows_by_geometry_filter(
+                tif_paths=tif_paths,
+                windows_df=ds_rows,
+                out_dir=out_vhr_dir,
+                expected_px=EXPECTED_PX,
+            )
 
-            print(f"Kept windows: {len(kept)} / {nwin}")
+            print(
+                f"Kept windows: {len(kept)} / {nwin} | "
+                f"wrong_shape={counts['wrong_shape']} | "
+                f"mosaic_once_used={counts['mosaic_once_used']} | "
+                f"mosaic_per_window_fallback={counts['mosaic_per_window_fallback']} | "
+                f"no_intersect={counts['no_intersect']}"
+            )
             if skipped:
-                print("Skipped:", skipped)
+                print("Skipped (first 30):", skipped[:30])
 
             if kept:
                 kept_ids = {k["window_id"] for k in kept}
@@ -362,36 +493,48 @@ def main():
                 kept_df = kept_df.merge(kept_meta, on="window_id", how="left")
                 kept_rows_all.append(kept_df)
 
-            per_ds_summary.append({
-                "datastrip": ds,
-                "split": split,
-                "windows": nwin,
-                "kept": int(len(kept)),
-                "skipped": int(nwin - len(kept)),
-                "error": "",
-            })
+            per_ds_summary.append(
+                {
+                    "datastrip": ds,
+                    "split": split,
+                    "windows": nwin,
+                    "kept": int(len(kept)),
+                    "skipped": int(nwin - len(kept)),
+                    "wrong_shape": int(counts["wrong_shape"]),
+                    "mosaic_once_used": int(counts["mosaic_once_used"]),
+                    "mosaic_per_window_fallback": int(counts["mosaic_per_window_fallback"]),
+                    "no_intersect": int(counts["no_intersect"]),
+                    "error": "",
+                }
+            )
 
-            log_line(f"OK datastrip={ds} kept={len(kept)} skipped={len(skipped)}")
+            log_line(
+                f"OK datastrip={ds} kept={len(kept)} "
+                f"wrong_shape={counts['wrong_shape']} "
+                f"mosaic_once_used={counts['mosaic_once_used']} "
+                f"mosaic_per_window_fallback={counts['mosaic_per_window_fallback']}"
+            )
             mark_done(ds)
-
 
         except Exception as e:
             log_line(f"[ERROR] datastrip={ds} err={e}")
-            per_ds_summary.append({"datastrip": ds, "split": split, "windows": nwin, "kept": 0, "skipped": nwin, "error": str(e)})
+            per_ds_summary.append(
+                {"datastrip": ds, "split": split, "windows": nwin, "kept": 0, "skipped": nwin, "error": str(e)}
+            )
 
         finally:
             shutil.rmtree(ds_tmp_dir, ignore_errors=True)
 
-    # Save filtered parquet with only successfully-kept windows
+    # Save parquet with only successfully-kept windows
     if kept_rows_all:
         kept_all = pd.concat(kept_rows_all, ignore_index=True)
     else:
-        kept_all = df.iloc[0:0].copy()  # empty with same columns
+        kept_all = df.iloc[0:0].copy()
 
     kept_all.to_parquet(OUT_KEPT_PARQUET, index=False)
     print(f"\nSaved kept windows parquet: {OUT_KEPT_PARQUET}  rows={len(kept_all)}")
 
-    # Optional: save per-datastrip summary CSV
+    # Save summary CSV
     summary_df = pd.DataFrame(per_ds_summary)
     summary_df.to_csv("vhr_download_summary.csv", index=False)
     print("Saved summary: vhr_download_summary.csv")

@@ -26,7 +26,7 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 # Geometry CRS
-WIN_CRS_URI = "http://www.opengis.net/def/crs/EPSG/0/3035"
+WIN_CRS_URL = "http://www.opengis.net/def/crs/EPSG/0/3035"
 
 # Download config
 BANDS_10M = ["B04", "B03", "B02", "B08"]  # Blue, Green, Red, NIR
@@ -176,7 +176,7 @@ def download_one_window(
             "bounds": {
                 "bbox": bbox,
                 "geometry": geom_3035.__geo_interface__,  # polygon clip
-                "properties": {"crs": WIN_CRS_URI},
+                "properties": {"crs": WIN_CRS_URL},
             },
             "data": [
                 {

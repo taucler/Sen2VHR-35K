@@ -10,12 +10,106 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, UTC
 from pathlib import Path
+import geopandas as gpd
+import pandas as pd
+import numpy as np
 
 load_dotenv()
 
 SESSION = requests.Session()
+_token = None
+_token_exp = 0
 
 to_4326 = Transformer.from_crs(3035, 4326, always_xy=True)
+
+# -----------------------
+# Grid helpers
+# -----------------------
+
+def get_datastrip_footprints(cand_parquet: str, catalog_gpkg: str, crs: str) -> gpd.GeoDataFrame:
+    cand = pd.read_parquet(cand_parquet)
+    if "datastrip" not in cand.columns:
+        raise RuntimeError(f"'datastrip' column not found in {cand_parquet}")
+
+    ds_list = sorted(cand["datastrip"].dropna().unique().tolist())
+
+    cat = gpd.read_file(catalog_gpkg)
+    if "datastrip" not in cat.columns:
+        raise RuntimeError(f"'datastrip' column not found in {catalog_gpkg}. Columns: {list(cat.columns)}")
+
+    if cat.crs is None:
+        cat = cat.set_crs("EPSG:4326")
+
+    cat = cat[cat["datastrip"].isin(ds_list)].copy()
+    cat = cat.to_crs(crs)
+
+    # ---- FIX INVALID GEOMETRIES ----
+    # Shapely 2.x: make_valid exists; buffer(0) is a common fallback
+    try:
+        cat["geometry"] = cat["geometry"].make_valid()
+    except Exception:
+        cat["geometry"] = cat["geometry"].buffer(0)
+
+    # drop empties after repair
+    cat = cat[~cat.geometry.is_empty & cat.geometry.notna()].copy()
+
+    # dissolve
+    cat = cat.dissolve(by="datastrip", as_index=False)
+
+    return cat[["datastrip", "geometry"]].copy()
+
+def estimate_utm_epsg(geom_wgs84, crs) -> int:
+    gs = gpd.GeoSeries([geom_wgs84], crs=crs)
+    utm = gs.estimate_utm_crs()
+    epsg = utm.to_epsg()
+    if epsg is None:
+        raise RuntimeError("Could not estimate UTM EPSG.")
+    return int(epsg)
+
+
+def generate_windows_max_count(geom_utm, window_m: float, edge_buffer_m: float, try_four_offsets: bool):
+    """
+    Windows are axis-aligned squares in UTM, touching inside the datastrip.
+    We apply an inward buffer to the datastrip footprint to avoid boundary overlap issues.
+    We try up to 4 grid origins and return the one with the maximum count.
+    """
+    inner = geom_utm.buffer(-edge_buffer_m)
+    if inner.is_empty:
+        return [], (0.0, 0.0)
+
+    minx, miny, maxx, maxy = inner.bounds
+    if (maxx - minx) < window_m or (maxy - miny) < window_m:
+        return [], (0.0, 0.0)
+
+    stride = window_m  # touching windows
+
+    offsets = [(0.0, 0.0)]
+    if try_four_offsets:
+        half = window_m / 2.0
+        offsets = [(0.0, 0.0), (half, 0.0), (0.0, half), (half, half)]
+
+    best_wins = []
+    best_offset = (0.0, 0.0)
+
+    # tiny shrink to avoid floating boundary issues
+    inner2 = inner.buffer(-0.01)
+
+    for ox, oy in offsets:
+        xs = np.arange(minx + ox, maxx - window_m + 1e-9, stride)
+        ys = np.arange(miny + oy, maxy - window_m + 1e-9, stride)
+
+        wins = []
+        for x in xs:
+            for y in ys:
+                w = box(x, y, x + window_m, y + window_m)
+                if w.within(inner2):
+                    wins.append(w)
+
+        if len(wins) > len(best_wins):
+            best_wins = wins
+            best_offset = (ox, oy)
+
+    return best_wins, best_offset
 
 def bbox_wkt_4326(geom_3035):
     geom_4326 = transform(to_4326.transform, geom_3035)
