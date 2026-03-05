@@ -1,4 +1,4 @@
-# Sen2VHR-28K
+# Sen2VHR-35K
 A Sentinel-2 to Very-High-Resolution Super-Resolution Dataset
 
 This dataset elaboration is based on the **Optical VHR coverage over Europe (VHR_IMAGE_2024)** dataset, available under registration request via the Copernicus Data Space Ecosystem (CDSE), following this [link](https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/ccm-how-to-register).
